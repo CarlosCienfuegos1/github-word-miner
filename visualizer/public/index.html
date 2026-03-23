@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GitHub Word Miner · Live Ranking</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0b0e14;
+      --surface:   #111520;
+      --border:    #1e2535;
+      --accent-py: #3fb950;
+      --accent-jv: #f78166;
+      --accent-al: #58a6ff;
+      --text:      #c9d1d9;
+      --muted:     #484f58;
+      --heading:   #e6edf3;
+      --mono:      'JetBrains Mono', 'Fira Code', monospace;
+      --sans:      'Segoe UI', system-ui, sans-serif;
+    }
+
+    html, body { height: 100%; background: var(--bg); color: var(--text);
+                 font-family: var(--sans); font-size: 14px; line-height: 1.5; }
+
+    .shell { display: grid; grid-template-rows: auto 1fr; height: 100vh; overflow: hidden; }
+
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 24px; height: 56px;
+      background: var(--surface); border-bottom: 1px solid var(--border);
+    }
+
+    .logo {
+      display: flex; align-items: center; gap: 10px;
+      font-family: var(--mono); font-size: 15px; font-weight: 700;
+      color: var(--heading); letter-spacing: -0.3px;
+    }
+
+    .status-dot {
+      width: 8px; height: 8px; border-radius: 50%; background: var(--muted);
+      transition: background .5s;
+    }
+    .status-dot.live {
+      background: var(--accent-py);
+      box-shadow: 0 0 6px var(--accent-py);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+    .controls { display: flex; align-items: center; gap: 16px; }
+
+    .tab-group {
+      display: flex; gap: 4px;
+      background: var(--bg); border: 1px solid var(--border);
+      border-radius: 8px; padding: 3px;
+    }
+
+    .tab {
+      padding: 4px 14px; border-radius: 6px; border: none;
+      background: transparent; color: var(--muted);
+      font-family: var(--mono); font-size: 12px; font-weight: 600;
+      cursor: pointer; transition: background .2s, color .2s; letter-spacing: .3px;
+    }
+    .tab:hover { color: var(--text); }
+    .tab.active[data-lang="all"]    { background: #1a2744; color: var(--accent-al); }
+    .tab.active[data-lang="python"] { background: #0d2318; color: var(--accent-py); }
+    .tab.active[data-lang="java"]   { background: #2b1810; color: var(--accent-jv); }
+
+    .slider-group { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+    .slider-group input[type=range] {
+      -webkit-appearance: none; width: 100px; height: 4px;
+      background: var(--border); border-radius: 2px; outline: none;
+    }
+    .slider-group input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none; width: 14px; height: 14px;
+      border-radius: 50%; background: var(--accent-al); cursor: pointer;
+    }
+    #topN-label { font-family: var(--mono); font-weight: 700; color: var(--text); min-width: 24px; }
+
+    .live-badge { display: flex; align-items: center; gap: 6px;
+                  font-family: var(--mono); font-size: 11px; color: var(--muted); }
+
+    .content { display: grid; grid-template-columns: 1fr 300px; overflow: hidden; }
+
+    .chart-panel { padding: 24px; overflow: hidden; display: flex; flex-direction: column; gap: 16px; }
+
+    .chart-title {
+      font-family: var(--mono); font-size: 11px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 1.2px; color: var(--muted);
+    }
+
+    .chart-wrap { flex: 1; position: relative; min-height: 0; }
+
+    .sidebar { border-left: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+
+    .sidebar-section { padding: 16px 20px; border-bottom: 1px solid var(--border); }
+
+    .sidebar-label {
+      font-family: var(--mono); font-size: 10px; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 1.4px; color: var(--muted); margin-bottom: 12px;
+    }
+
+    .stat-row { display: flex; justify-content: space-between; align-items: baseline; padding: 5px 0; }
+    .stat-label { color: var(--muted); font-size: 12px; }
+    .stat-value { font-family: var(--mono); font-size: 14px; font-weight: 700; color: var(--heading); transition: color .4s; }
+    .stat-value.flash { color: var(--accent-al); }
+
+    .rank-list { flex: 1; overflow-y: auto; padding: 0 20px 16px;
+                 scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+
+    .rank-item {
+      display: grid; grid-template-columns: 28px 1fr auto;
+      align-items: center; gap: 8px; padding: 7px 0;
+      border-bottom: 1px solid var(--border);
+      animation: fadeIn .3s ease;
+    }
+    .rank-item:last-child { border-bottom: none; }
+
+    @keyframes fadeIn { from{opacity:0;transform:translateX(8px)} to{opacity:1;transform:translateX(0)} }
+
+    .rank-num  { font-family: var(--mono); font-size: 11px; color: var(--muted); text-align: right; }
+    .rank-word { font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--heading);
+                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .rank-bar-wrap { width: 60px; display: flex; align-items: center; gap: 6px; }
+    .rank-bar-bg { flex: 1; height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
+    .rank-bar { height: 100%; border-radius: 2px; background: var(--accent-al); transition: width .5s ease; }
+    .rank-count { font-family: var(--mono); font-size: 10px; color: var(--muted); min-width: 32px; text-align: right; }
+
+    .empty {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      height: 100%; gap: 12px; color: var(--muted); font-family: var(--mono); font-size: 13px;
+    }
+    .spinner { width: 32px; height: 32px; border: 2px solid var(--border);
+               border-top-color: var(--accent-al); border-radius: 50%; animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+<div class="shell">
+
+  <header>
+    <div class="logo">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none"
+           stroke="#58a6ff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61
+                 c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0
+                 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09
+                 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61
+                 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/>
+      </svg>
+      word-miner <span style="color:var(--muted);font-weight:400">/ live</span>
+    </div>
+
+    <div class="controls">
+      <div class="tab-group">
+        <button class="tab active" data-lang="all">all</button>
+        <button class="tab" data-lang="python">python</button>
+        <button class="tab" data-lang="java">java</button>
+      </div>
+
+      <div class="slider-group">
+        <span>top</span>
+        <input type="range" id="topN-slider" min="5" max="50" value="20" step="5" />
+        <span id="topN-label">20</span>
+      </div>
+
+      <div class="live-badge">
+        <div class="status-dot" id="status-dot"></div>
+        <span id="status-text">connecting…</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="content">
+    <div class="chart-panel">
+      <div class="chart-title" id="chart-title">Top words across all languages</div>
+      <div class="chart-wrap">
+        <div class="empty" id="empty-state">
+          <div class="spinner"></div>
+          <span>Waiting for data from miner…</span>
+        </div>
+        <canvas id="chart" style="display:none"></canvas>
+      </div>
+    </div>
+
+    <div class="sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-label">Miner Stats</div>
+        <div class="stat-row"><span class="stat-label">repos processed</span><span class="stat-value" id="stat-repos">—</span></div>
+        <div class="stat-row"><span class="stat-label">words extracted</span><span class="stat-value" id="stat-words">—</span></div>
+        <div class="stat-row"><span class="stat-label">unique (python)</span><span class="stat-value" id="stat-py">—</span></div>
+        <div class="stat-row"><span class="stat-label">unique (java)</span>  <span class="stat-value" id="stat-jv">—</span></div>
+      </div>
+      <div class="sidebar-label" style="padding:16px 20px 0">Ranking</div>
+      <div class="rank-list" id="rank-list"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const LANG_COLOR = { all: '#58a6ff', python: '#3fb950', java: '#f78166' };
+const CHART_TITLE = {
+  all:    'Top words across all languages',
+  python: 'Top words · Python',
+  java:   'Top words · Java',
+};
+
+let currentLang = 'all';
+let currentTopN = 20;
+let evtSource    = null;
+let chart        = null;
+
+// ── Chart ──────────────────────────────────────────────────────────────────
+function buildChart(labels, values, lang) {
+  const ctx      = document.getElementById('chart').getContext('2d');
+  const color    = LANG_COLOR[lang];
+  const gradient = ctx.createLinearGradient(0, 0, 0, 400);
+  gradient.addColorStop(0, color + 'cc');
+  gradient.addColorStop(1, color + '22');
+
+  return new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{ data: values, backgroundColor: gradient,
+                   borderColor: color, borderWidth: 1,
+                   borderRadius: 4, borderSkipped: false }]
+    },
+    options: {
+      indexAxis: 'y',
+      animation: { duration: 500 },
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#111520', borderColor: '#1e2535', borderWidth: 1,
+          titleColor: '#e6edf3', bodyColor: '#c9d1d9',
+          callbacks: { label: ctx => ` ${ctx.raw.toLocaleString()} occurrences` }
+        }
+      },
+      scales: {
+        x: { grid: { color: '#1e2535' },
+             ticks: { color: '#484f58', font: { family: 'monospace', size: 11 } } },
+        y: { grid: { display: false },
+             ticks: { color: '#c9d1d9', font: { family: 'monospace', size: 12 } } }
+      }
+    }
+  });
+}
+
+// ── Update UI ──────────────────────────────────────────────────────────────
+function updateUI({ words, meta }) {
+  document.getElementById('status-dot').classList.add('live');
+  document.getElementById('status-text').textContent = 'live';
+
+  flash('stat-repos', meta.repos_processed.toLocaleString());
+  flash('stat-words', meta.words_total.toLocaleString());
+  flash('stat-py',    meta.python_total.toLocaleString());
+  flash('stat-jv',    meta.java_total.toLocaleString());
+
+  if (!words?.length) return;
+
+  document.getElementById('empty-state').style.display = 'none';
+  const canvas = document.getElementById('chart');
+  canvas.style.display = 'block';
+
+  const labels = words.map(w => w.word);
+  const values = words.map(w => w.count);
+  const color  = LANG_COLOR[currentLang];
+
+  if (!chart) {
+    chart = buildChart(labels, values, currentLang);
+  } else {
+    const ctx      = canvas.getContext('2d');
+    const gradient = ctx.createLinearGradient(0, 0, 0, 400);
+    gradient.addColorStop(0, color + 'cc');
+    gradient.addColorStop(1, color + '22');
+    chart.data.labels = labels;
+    chart.data.datasets[0].data            = values;
+    chart.data.datasets[0].borderColor     = color;
+    chart.data.datasets[0].backgroundColor = gradient;
+    chart.update('active');
+  }
+
+  document.getElementById('chart-title').textContent = CHART_TITLE[currentLang];
+  renderRanking(words, values[0]);
+}
+
+function flash(id, value) {
+  const el = document.getElementById(id);
+  if (el.textContent !== value) {
+    el.textContent = value;
+    el.classList.add('flash');
+    setTimeout(() => el.classList.remove('flash'), 800);
+  }
+}
+
+function renderRanking(words, maxCount) {
+  const color = LANG_COLOR[currentLang];
+  document.getElementById('rank-list').innerHTML = words.map((w, i) => {
+    const pct = maxCount > 0 ? (w.count / maxCount * 100).toFixed(1) : 0;
+    return `
+      <div class="rank-item">
+        <span class="rank-num">${i + 1}</span>
+        <span class="rank-word">${w.word}</span>
+        <div class="rank-bar-wrap">
+          <div class="rank-bar-bg">
+            <div class="rank-bar" style="width:${pct}%;background:${color}"></div>
+          </div>
+          <span class="rank-count">${w.count.toLocaleString()}</span>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+// ── SSE ────────────────────────────────────────────────────────────────────
+function connect() {
+  evtSource?.close();
+  evtSource = new EventSource(`/stream?language=${currentLang}&top_n=${currentTopN}`);
+
+  evtSource.onmessage = ({ data }) => {
+    try {
+      const payload = JSON.parse(data);
+      if (!payload.error) updateUI(payload);
+    } catch (_) {}
+  };
+
+  evtSource.onerror = () => {
+    document.getElementById('status-dot').classList.remove('live');
+    document.getElementById('status-text').textContent = 'reconnecting…';
+  };
+}
+
+// ── Controls ───────────────────────────────────────────────────────────────
+document.querySelectorAll('.tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentLang = btn.dataset.lang;
+    if (chart) { chart.destroy(); chart = null; }
+    connect();
+  });
+});
+
+const slider = document.getElementById('topN-slider');
+let debounce = null;
+slider.addEventListener('input', () => {
+  currentTopN = parseInt(slider.value, 10);
+  document.getElementById('topN-label').textContent = currentTopN;
+  clearTimeout(debounce);
+  debounce = setTimeout(connect, 400);
+});
+
+connect();
+</script>
+</body>
+</html>
