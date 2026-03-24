@@ -1,3 +1,17 @@
+"""
+Miner de Nombres de Funciones en GitHub
+----------------------------------------
+Obtiene código fuente Python y Java desde los repositorios más populares de GitHub,
+extrae palabras desde los nombres de funciones y métodos (respetando camelCase y snake_case),
+y publica los conteos de palabras en sorted sets de Redis.
+
+Arquitectura: Lado productor del pipeline productor–consumidor.
+              Las palabras se escriben en sorted sets de Redis:
+                  word_counts:python  – conteos solo de Python
+                  word_counts:java    – conteos solo de Java
+                  word_counts:all     – conteos combinados
+"""
+
 import ast
 import base64
 import logging
@@ -5,36 +19,36 @@ import os
 import re
 import time
 from typing import Generator
- 
+
 import redis
 import requests
- 
-# ── Logging ──────────────────────────────────────────────────────────────────
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("miner")
- 
-# ── Configuration (env-overridable) ──────────────────────────────────────────
-GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
-REDIS_URL: str = os.getenv("REDIS_URL", "redis://redis:6379")
-MAX_FILES_PER_REPO: int = int(os.getenv("MAX_FILES_PER_REPO", "30"))
-REPOS_PER_PAGE: int = int(os.getenv("REPOS_PER_PAGE", "5"))
+
+# ── Configuración (sobreescribible por variables de entorno) ──────────────────
+GITHUB_TOKEN: str          = os.getenv("GITHUB_TOKEN", "")
+REDIS_URL: str             = os.getenv("REDIS_URL", "redis://redis:6379")
+MAX_FILES_PER_REPO: int    = int(os.getenv("MAX_FILES_PER_REPO", "30"))
+REPOS_PER_PAGE: int        = int(os.getenv("REPOS_PER_PAGE", "5"))
 SLEEP_BETWEEN_FILES: float = float(os.getenv("SLEEP_BETWEEN_FILES", "0.3"))
 SLEEP_BETWEEN_REPOS: float = float(os.getenv("SLEEP_BETWEEN_REPOS", "2.0"))
-MIN_WORD_LENGTH: int = int(os.getenv("MIN_WORD_LENGTH", "2"))
- 
-# ── Constants ─────────────────────────────────────────────────────────────────
+MIN_WORD_LENGTH: int       = int(os.getenv("MIN_WORD_LENGTH", "2"))
+
+# ── Constantes ────────────────────────────────────────────────────────────────
 REDIS_KEYS = {
     "python": "word_counts:python",
-    "java": "word_counts:java",
-    "all": "word_counts:all",
+    "java":   "word_counts:java",
+    "all":    "word_counts:all",
 }
-# Metadata key: total repos/files processed
+# Clave de metadatos: total de repos y archivos procesados
 META_KEY = "miner:meta"
- 
+
 JAVA_KEYWORDS = frozenset(
     {
         "if", "for", "while", "switch", "catch", "try", "else", "do",
@@ -45,91 +59,91 @@ JAVA_KEYWORDS = frozenset(
         "long", "double", "float", "short", "byte", "char",
     }
 )
- 
- 
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  Word splitting
+#  División de identificadores
 # ══════════════════════════════════════════════════════════════════════════════
- 
+
 def split_identifier(name: str) -> list[str]:
     """
-    Split a function/method identifier into constituent words.
- 
-    Handles:
-      - snake_case  → split on underscores
-      - camelCase   → split on case boundaries
-      - PascalCase  → same
-      - ALL_CAPS    → treated as single word per segment
-      - Mixed       → snake + camel combined (e.g. get_HTTPResponse)
- 
-    Examples:
-        make_response     → ["make", "response"]
-        retainAll         → ["retain", "all"]
-        getHTTPStatus     → ["get", "http", "status"]
-        __init__          → ["init"]
+    Divide un identificador de función/método en sus palabras componentes.
+
+    Maneja:
+      - snake_case  → divide por guiones bajos
+      - camelCase   → divide por límites de mayúsculas/minúsculas
+      - PascalCase  → igual que camelCase
+      - ALL_CAPS    → cada segmento se trata como una palabra
+      - Mixto       → snake + camel combinados (ej: get_HTTPResponse)
+
+    Ejemplos:
+        make_response  → ["make", "response"]
+        retainAll      → ["retain", "all"]
+        getHTTPStatus  → ["get", "http", "status"]
+        __init__       → ["init"]
     """
-    # Strip leading/trailing underscores (Python dunders, private markers)
+    # Eliminar guiones bajos al inicio/fin (dunders de Python, marcadores privados)
     name = name.strip("_")
     if not name:
         return []
- 
-    # First split on underscores (snake_case)
+
+    # Primero dividir por guiones bajos (snake_case)
     snake_parts: list[str] = [p for p in name.split("_") if p]
- 
+
     words: list[str] = []
     for part in snake_parts:
-        # Then split camelCase within each segment:
-        # Insert boundary before sequences like: lowercase→Uppercase, Uppercase→UppercaseLower
+        # Luego dividir camelCase dentro de cada segmento:
+        # Insertar límite antes de: minúscula→Mayúscula y MAYÚSCULAS→MayúsculaMinúscula
         camel_split = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", part)
         camel_split = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", camel_split)
         words.extend(camel_split.lower().split("_"))
- 
+
     return [w for w in words if len(w) >= MIN_WORD_LENGTH and w.isalpha()]
- 
- 
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  Source-code parsers
+#  Parsers de código fuente
 # ══════════════════════════════════════════════════════════════════════════════
- 
+
 def extract_words_python(source: str) -> list[str]:
-    """Parse Python source with the built-in `ast` module and collect all
-    function/method names (FunctionDef and AsyncFunctionDef nodes)."""
+    """Parsea código Python con el módulo `ast` incorporado y recolecta todos
+    los nombres de funciones y métodos (nodos FunctionDef y AsyncFunctionDef)."""
     words: list[str] = []
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return words
- 
+
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             words.extend(split_identifier(node.name))
- 
+
     return words
- 
- 
-# Java method declaration regex.
-# Matches: [modifiers] <returnType> <methodName> ( ... ) [throws ...] {
-# Group 1 → method name
+
+
+# Regex para detectar declaraciones de métodos en Java.
+# Coincide con: [modificadores] <tipoRetorno> <nombreMétodo> ( ... ) [throws ...] {
+# Grupo 1 → nombre del método
 _JAVA_METHOD_RE = re.compile(
     r"""
     \b
     (?:(?:public|private|protected|static|final|abstract|
           synchronized|native|strictfp|default|transient|volatile)
-       \s+)*                              # zero or more modifiers
-    (?:[\w<>\[\],\s?]+?\s+)?              # return type (optional, non-greedy)
-    (\w+)                                  # ← method name (group 1)
-    \s*\(                                  # opening parenthesis
+       \s+)*                              # cero o más modificadores
+    (?:[\w<>\[\],\s?]+?\s+)?              # tipo de retorno (opcional, no codicioso)
+    (\w+)                                  # ← nombre del método (grupo 1)
+    \s*\(                                  # paréntesis de apertura
     """,
     re.VERBOSE,
 )
- 
- 
+
+
 def extract_words_java(source: str) -> list[str]:
-    """Extract method names from Java source using a regex heuristic.
- 
-    A full Java parser (e.g. javalang) is more accurate but adds a heavy
-    dependency and slows startup; this regex handles the overwhelming majority
-    of real-world cases without false positives for keywords.
+    """Extrae nombres de métodos de código Java usando una heurística de regex.
+
+    Un parser completo de Java (ej: javalang) sería más preciso pero agrega
+    una dependencia pesada y ralentiza el inicio; este regex maneja la gran
+    mayoría de casos reales sin falsos positivos por palabras reservadas.
     """
     words: list[str] = []
     for match in _JAVA_METHOD_RE.finditer(source):
@@ -138,57 +152,57 @@ def extract_words_java(source: str) -> list[str]:
             continue
         words.extend(split_identifier(name))
     return words
- 
- 
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  GitHub API helpers
+#  Helpers para la API de GitHub
 # ══════════════════════════════════════════════════════════════════════════════
- 
+
 def _gh_headers() -> dict:
     h = {"Accept": "application/vnd.github.v3+json"}
     if GITHUB_TOKEN:
         h["Authorization"] = f"token {GITHUB_TOKEN}"
     return h
- 
- 
+
+
 def _gh_get(url: str, params: dict | None = None) -> requests.Response | None:
-    """GET a GitHub API URL, handling rate-limit back-off automatically."""
-    for attempt in range(3):
+    """Realiza un GET a la API de GitHub manejando automáticamente el rate limit."""
+    for intento in range(3):
         try:
             resp = requests.get(url, headers=_gh_headers(), params=params, timeout=15)
         except requests.RequestException as exc:
-            log.warning("Network error (%s). Retry %d/3", exc, attempt + 1)
-            time.sleep(5 * (attempt + 1))
+            log.warning("Error de red (%s). Reintento %d/3", exc, intento + 1)
+            time.sleep(5 * (intento + 1))
             continue
- 
+
         if resp.status_code == 403:
             reset_ts = int(resp.headers.get("X-RateLimit-Reset", time.time() + 60))
-            wait = max(reset_ts - time.time(), 5)
-            log.warning("Rate-limited by GitHub. Sleeping %.0fs …", wait)
-            time.sleep(wait)
+            espera = max(reset_ts - time.time(), 5)
+            log.warning("Rate limit alcanzado. Esperando %.0fs …", espera)
+            time.sleep(espera)
             continue
- 
+
         if resp.status_code == 404:
             return None
- 
+
         if resp.status_code != 200:
-            log.warning("GitHub returned %d for %s", resp.status_code, url)
+            log.warning("GitHub retornó %d para %s", resp.status_code, url)
             return None
- 
+
         return resp
- 
+
     return None
- 
- 
+
+
 def iter_repos(language: str) -> Generator[dict, None, None]:
-    """Yield repository metadata dicts, sorted by stars descending.
- 
-    Cycles through pages 1-10 (≈500 repos per language) then restarts so
-    the miner runs continuously.
+    """Genera diccionarios de metadatos de repositorios, ordenados por stars descendente.
+
+    Cicla por las páginas 1-10 (aprox. 500 repos por lenguaje) y luego reinicia
+    para que el miner corra de forma continua.
     """
     page = 1
     while True:
-        log.info("Fetching page %d of %s repos …", page, language)
+        log.info("Obteniendo página %d de repos %s …", page, language)
         resp = _gh_get(
             "https://api.github.com/search/repositories",
             params={
@@ -202,36 +216,36 @@ def iter_repos(language: str) -> Generator[dict, None, None]:
         if resp is None:
             time.sleep(10)
             continue
- 
+
         items = resp.json().get("items", [])
         if not items:
-            log.info("No more %s repos on page %d. Restarting …", language, page)
+            log.info("No hay más repos %s en página %d. Reiniciando …", language, page)
             page = 1
             continue
- 
+
         yield from items
-        page = (page % 10) + 1  # pages 1–10, then wrap
- 
- 
+        page = (page % 10) + 1  # páginas 1–10, luego vuelve a 1
+
+
 def get_file_paths(owner: str, repo: str, extension: str) -> list[str]:
-    """Return all file paths in a repo matching *extension* (e.g. '.py')."""
+    """Retorna todas las rutas de archivos en un repo que coincidan con *extension* (ej: '.py')."""
     resp = _gh_get(
         f"https://api.github.com/repos/{owner}/{repo}/git/trees/HEAD",
         params={"recursive": "1"},
     )
     if resp is None:
         return []
- 
+
     tree = resp.json().get("tree", [])
     return [
         item["path"]
         for item in tree
         if item.get("type") == "blob" and item["path"].endswith(extension)
     ]
- 
- 
+
+
 def get_file_content(owner: str, repo: str, path: str) -> str | None:
-    """Fetch and decode (base64) the content of a single file."""
+    """Obtiene y decodifica (base64) el contenido de un archivo."""
     resp = _gh_get(f"https://api.github.com/repos/{owner}/{repo}/contents/{path}")
     if resp is None:
         return None
@@ -240,28 +254,28 @@ def get_file_content(owner: str, repo: str, path: str) -> str | None:
         raw = data.get("content", "")
         return base64.b64decode(raw).decode("utf-8", errors="ignore")
     return None
- 
- 
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  Redis publisher
+#  Publicador en Redis
 # ══════════════════════════════════════════════════════════════════════════════
- 
+
 def connect_redis() -> redis.Redis:
     client = redis.from_url(REDIS_URL, decode_responses=True)
     for i in range(10):
         try:
             client.ping()
-            log.info("Connected to Redis at %s", REDIS_URL)
+            log.info("Conectado a Redis en %s", REDIS_URL)
             return client
         except redis.ConnectionError:
-            log.warning("Redis not ready. Retry %d/10 …", i + 1)
+            log.warning("Redis no disponible. Reintento %d/10 …", i + 1)
             time.sleep(3)
-    raise RuntimeError("Could not connect to Redis")
- 
- 
+    raise RuntimeError("No se pudo conectar a Redis")
+
+
 def publish_words(r: redis.Redis, language: str, words: list[str]) -> None:
-    """Atomically increment word counts in both the language-specific and
-    combined Redis sorted sets."""
+    """Incrementa atómicamente los conteos de palabras en los sorted sets
+    específicos del lenguaje y en el combinado."""
     if not words:
         return
     pipe = r.pipeline()
@@ -269,96 +283,95 @@ def publish_words(r: redis.Redis, language: str, words: list[str]) -> None:
         pipe.zincrby(REDIS_KEYS[language], 1, word)
         pipe.zincrby(REDIS_KEYS["all"], 1, word)
     pipe.execute()
- 
- 
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  Main processing loop
+#  Bucle principal de procesamiento
 # ══════════════════════════════════════════════════════════════════════════════
- 
+
 LANGUAGE_CONFIG = {
-    "python": {"extension": ".py", "extractor": extract_words_python},
-    "java": {"extension": ".java", "extractor": extract_words_java},
+    "python": {"extension": ".py",   "extractor": extract_words_python},
+    "java":   {"extension": ".java", "extractor": extract_words_java},
 }
- 
- 
+
+
 def process_repo(r: redis.Redis, owner: str, repo_name: str, language: str) -> int:
-    """Process a single repository; return total words published."""
+    """Procesa un repositorio completo; retorna el total de palabras publicadas."""
     cfg = LANGUAGE_CONFIG[language]
     log.info("  ▶ %s/%s  [%s]", owner, repo_name, language)
- 
+
     paths = get_file_paths(owner, repo_name, cfg["extension"])
     if not paths:
-        log.info("    No %s files found.", cfg["extension"])
+        log.info("    No se encontraron archivos %s.", cfg["extension"])
         return 0
- 
-    # Limit files per repo to stay within API rate limits
+
+    # Limitar archivos por repo para no exceder el rate limit de la API
     paths = paths[:MAX_FILES_PER_REPO]
-    log.info("    %d file(s) to process …", len(paths))
- 
+    log.info("    %d archivo(s) a procesar …", len(paths))
+
     total_words = 0
     for fpath in paths:
         content = get_file_content(owner, repo_name, fpath)
         if content is None:
             continue
- 
+
         words = cfg["extractor"](content)
         publish_words(r, language, words)
         total_words += len(words)
- 
+
         time.sleep(SLEEP_BETWEEN_FILES)
- 
-    log.info("    ✓ %d words extracted.", total_words)
+
+    log.info("    ✓ %d palabras extraídas.", total_words)
     return total_words
- 
- 
+
+
 def main() -> None:
     r = connect_redis()
- 
-    # Track processed repos in memory to avoid duplicate processing in one pass
-    processed: set[tuple[str, str]] = set()
+
+    # Registro en memoria de repos ya procesados para evitar duplicados en un ciclo
+    procesados: set[tuple[str, str]] = set()
     stats = {"repos": 0, "words": 0}
- 
-    # Interleave Python and Java repositories
+
+    # Intercalar repositorios Python y Java
     python_gen = iter_repos("python")
-    java_gen = iter_repos("java")
- 
-    log.info("Miner started. Processing repositories continuously …")
- 
+    java_gen   = iter_repos("java")
+
+    log.info("Miner iniciado. Procesando repositorios de forma continua …")
+
     while True:
         for language, gen in [("python", python_gen), ("java", java_gen)]:
             repo = next(gen)
             full_name: str = repo["full_name"]
             key = (full_name, language)
- 
-            if key in processed:
-                log.info("  (skip) Already processed %s [%s]", full_name, language)
+
+            if key in procesados:
+                log.info("  (omitir) Ya procesado %s [%s]", full_name, language)
                 continue
- 
+
             owner, repo_name = full_name.split("/", 1)
             try:
                 words = process_repo(r, owner, repo_name, language)
-                processed.add(key)
+                procesados.add(key)
                 stats["repos"] += 1
                 stats["words"] += words
- 
-                # Store live stats so the visualizer can display them
+
+                # Guardar estadísticas en vivo para que el visualizer las muestre
                 r.hset(
                     META_KEY,
                     mapping={
                         "repos_processed": stats["repos"],
-                        "words_total": stats["words"],
+                        "words_total":     stats["words"],
                     },
                 )
             except Exception as exc:
-                log.error("Error processing %s: %s", full_name, exc)
- 
+                log.error("Error procesando %s: %s", full_name, exc)
+
             time.sleep(SLEEP_BETWEEN_REPOS)
- 
-        # Reset processed set every 1 000 repos to allow re-processing
-        if len(processed) > 1_000:
-            processed.clear()
- 
- 
+
+        # Limpiar el set cada 1.000 repos para evitar fugas de memoria
+        if len(procesados) > 1_000:
+            procesados.clear()
+
+
 if __name__ == "__main__":
     main()
- 

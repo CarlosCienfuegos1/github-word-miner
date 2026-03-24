@@ -1,0 +1,73 @@
+version: "3.9"
+
+# ═══════════════════════════════════════════════════════════════════
+#  Miner de Palabras de GitHub  –  Productor / Consumidor via Redis
+# ═══════════════════════════════════════════════════════════════════
+#
+#  Inicio rápido:
+#    GITHUB_TOKEN=ghp_xxx docker compose up --build
+#
+#  Servicios:
+#    redis       – broker compartido / almacén de sorted sets
+#    miner       – obtiene repos de GitHub, extrae palabras, escribe en Redis
+#    visualizer  – lee desde Redis, sirve el dashboard en vivo en el puerto :5000
+# ═══════════════════════════════════════════════════════════════════
+
+services:
+
+  # ── Redis ──────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Miner ──────────────────────────────────────────────────────
+  miner:
+    build:
+      context: ./miner
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      # Requerido: configurar via archivo .env o exportar antes de ejecutar compose
+      GITHUB_TOKEN: "${GITHUB_TOKEN}"
+      REDIS_URL: "redis://redis:6379"
+      # Ajuste opcional de parámetros
+      MAX_FILES_PER_REPO: "${MAX_FILES_PER_REPO:-30}"
+      REPOS_PER_PAGE: "${REPOS_PER_PAGE:-5}"
+      SLEEP_BETWEEN_FILES: "${SLEEP_BETWEEN_FILES:-0.3}"
+      SLEEP_BETWEEN_REPOS: "${SLEEP_BETWEEN_REPOS:-2.0}"
+      MIN_WORD_LENGTH: "${MIN_WORD_LENGTH:-2}"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Visualizer ─────────────────────────────────────────────────
+  visualizer:
+    build:
+      context: ./visualizer
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "${VISUALIZER_PORT:-5000}:5000"
+    environment:
+      REDIS_URL: "redis://redis:6379"
+      DEFAULT_TOP_N: "${DEFAULT_TOP_N:-20}"
+      SSE_INTERVAL: "${SSE_INTERVAL:-3.0}"
+
+volumes:
+  redis-data:
